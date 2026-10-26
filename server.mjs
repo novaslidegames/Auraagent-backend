@@ -1,305 +1,189 @@
-
 import http from "node:http";
-import { randomUUID } from "node:crypto";
-import OpenAI from "openai";
 
-const PORT = Number(process.env.PORT) || 3000;
-const ACCESS_TOKEN = process.env.AGENT_ACCESS_TOKEN;
-const API_KEY = process.env.OPENAI_API_KEY;
+const PORT = Number(process.env.PORT || 10000);
+const ACCESS_TOKEN = process.env.AGENT_ACCESS_TOKEN || "";
+const GEMINI_API_KEY = process.env.GEMINI_API_KEY || "";
+const GEMINI_MODEL = process.env.GEMINI_MODEL || "gemini-2.5-flash";
 
-if (!API_KEY || !ACCESS_TOKEN) {
-  throw new Error("Missing server environment variables");
-}
-
-const client = new OpenAI({
-  apiKey: API_KEY
-});
-
-const tasks = [];
-
-const tools = [
-  {
-    type: "function",
-    function: {
-      name: "create_task",
-      description: "Create a task for the user",
-      parameters: {
-        type: "object",
-        properties: {
-          title: { type: "string" }
-        },
-        required: ["title"]
-      }
-    }
-  },
-  {
-    type: "function",
-    function: {
-      name: "list_tasks",
-      description: "List saved tasks",
-      parameters: {
-        type: "object",
-        properties: {}
-      }
-    }
-  },
-  {
-    type: "function",
-    function: {
-      name: "complete_task",
-      description: "Complete a task by ID",
-      parameters: {
-        type: "object",
-        properties: {
-          id: { type: "string" }
-        },
-        required: ["id"]
-      }
-    }
-  }
-];
-
-function runTool(name, args) {
-  if (name === "create_task") {
-    const title = String(args.title || "").trim();
-
-    if (!title || title.length > 200) {
-      return { error: "Invalid task title" };
-    }
-
-    const task = {
-      id: randomUUID(),
-      title,
-      completed: false
-    };
-
-    tasks.push(task);
-    return task;
-  }
-
-  if (name === "list_tasks") {
-    return tasks;
-  }
-
-  if (name === "complete_task") {
-    const task = tasks.find(
-      t => t.id === args.id
-    );
-
-    if (!task) {
-      return { error: "Task not found" };
-    }
-
-    task.completed = true;
-    return task;
-  }
-
-  return { error: "Unknown tool" };
-}
-
-async function askAI(messages) {
-  const history = messages.map(m => ({
-    role: m.role,
-    content: m.content
-  }));
-
-  const systemMessage = {
-    role: "system",
-    content:
-      "You are AuraAgent, a helpful AI assistant. " +
-      "Use tools to manage tasks when requested. " +
-      "Never claim an action succeeded unless confirmed."
-  };
-
-  for (let i = 0; i < 5; i++) {
-    const response =
-      await client.chat.completions.create({
-        model:
-          process.env.OPENAI_MODEL ||
-          "gpt-4.1-mini",
-        messages: [
-          systemMessage,
-          ...history
-        ],
-        tools
-      });
-
-    const message =
-      response.choices[0]?.message;
-
-    if (!message) {
-      throw new Error("No AI response");
-    }
-
-    if (!message.tool_calls?.length) {
-      return message.content || "No response";
-    }
-
-    history.push(message);
-
-    for (const call of message.tool_calls) {
-      let result;
-
-      try {
-        result = runTool(
-          call.function.name,
-          JSON.parse(
-            call.function.arguments || "{}"
-          )
-        );
-      } catch {
-        result = {
-          error: "Invalid tool arguments"
-        };
-      }
-
-      history.push({
-        role: "tool",
-        tool_call_id: call.id,
-        content: JSON.stringify(result)
-      });
-    }
-  }
-
-  return "Unable to complete this request.";
-}
-
-function sendJSON(res, status, body) {
+function sendJSON(res, status, data) {
   res.writeHead(status, {
-    "Content-Type":
-      "application/json; charset=utf-8",
-    "Cache-Control": "no-store"
+    "Content-Type": "application/json; charset=utf-8",
+    "Access-Control-Allow-Origin": "*",
+    "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
+    "Access-Control-Allow-Headers": "Content-Type, Authorization, X-Agent-Token"
   });
-
-  res.end(JSON.stringify(body));
+  res.end(JSON.stringify(data));
 }
 
-const server = http.createServer(
-  async (req, res) => {
-    const pathname = new URL(
-      req.url || "/",
-      "http://localhost"
-    ).pathname;
+async function readJSON(req) {
+  let body = "";
 
-    console.log(
-      "Incoming request:",
-      req.method,
-      pathname
-    );
+  for await (const chunk of req) {
+    body += chunk.toString();
 
-    // Main page
-    if (
-      pathname === "/" &&
-      req.method === "GET"
-    ) {
-      return sendJSON(res, 200, {
-        app: "AuraAgent",
-        status: "online",
-        message: "Backend is running"
-      });
+    if (body.length > 1024 * 1024) {
+      throw new Error("Request too large");
     }
+  }
 
-    // Health check
-    if (
-      (pathname === "/health" ||
-        pathname === "/health/") &&
-      req.method === "GET"
-    ) {
-      return sendJSON(res, 200, {
-        status: "ok",
-        service: "AuraAgent Backend"
-      });
-    }
+  return body ? JSON.parse(body) : {};
+}
 
-    // Chat endpoint
-    if (
-      pathname === "/chat" &&
-      req.method === "POST"
-    ) {
-      if (
-        req.headers.authorization !==
-        `Bearer ${ACCESS_TOKEN}`
-      ) {
-        return sendJSON(res, 401, {
-          error: "Unauthorized"
-        });
-      }
+function getToken(req) {
+  const auth = req.headers.authorization || "";
+  if (auth.startsWith("Bearer ")) {
+    return auth.slice(7).trim();
+  }
 
-      try {
-        let raw = "";
+  return String(req.headers["x-agent-token"] || "").trim();
+}
 
-        for await (const chunk of req) {
-          raw += chunk.toString();
+function makeContents(data) {
+  const messages = Array.isArray(data.messages)
+    ? data.messages
+    : [];
 
-          if (raw.length > 100000) {
-            return sendJSON(res, 413, {
-              error: "Request too large"
-            });
-          }
-        }
+  const contents = messages
+    .filter(m => typeof m.content === "string" && m.content.trim())
+    .map(m => ({
+      role: m.role === "assistant" ? "model" : "user",
+      parts: [{ text: m.content }]
+    }));
 
-        let body;
+  const prompt = data.message || data.prompt || data.text;
 
-        try {
-          body = JSON.parse(raw);
-        } catch {
-          return sendJSON(res, 400, {
-            error: "Invalid JSON"
-          });
-        }
-
-        if (
-          !Array.isArray(body.messages) ||
-          body.messages.length < 1 ||
-          body.messages.length > 40 ||
-          body.messages.some(m =>
-            !m ||
-            !["user", "assistant"].includes(
-              m.role
-            ) ||
-            typeof m.content !== "string" ||
-            m.content.length > 10000
-          )
-        ) {
-          return sendJSON(res, 400, {
-            error: "Invalid messages"
-          });
-        }
-
-        const reply = await askAI(
-          body.messages
-        );
-
-        return sendJSON(res, 200, {
-          reply
-        });
-
-      } catch (error) {
-        console.error(
-          "AI request error:",
-          error
-        );
-
-        return sendJSON(res, 500, {
-          error: "AI request failed"
-        });
-      }
-    }
-
-    return sendJSON(res, 404, {
-      error: "Not found",
-      path: pathname
+  if (contents.length === 0 && typeof prompt === "string" && prompt.trim()) {
+    contents.push({
+      role: "user",
+      parts: [{ text: prompt }]
     });
   }
-);
 
-server.listen(
-  PORT,
-  "0.0.0.0",
-  () => {
-    console.log(
-      `AuraAgent running on port ${PORT}`
-    );
+  return contents;
+}
+
+const server = http.createServer(async (req, res) => {
+  if (req.method === "OPTIONS") {
+    return sendJSON(res, 200, { ok: true });
   }
-);
+
+  const path = new URL(req.url, "http://localhost").pathname;
+
+  if (req.method === "GET" &&
+      (path === "/" || path === "/health" || path === "/api/health")) {
+    return sendJSON(res, 200, {
+      status: "ok",
+      service: "Nova AI Backend",
+      provider: "gemini"
+    });
+  }
+
+  if (req.method !== "POST" ||
+      !["/chat", "/api/chat", "/ask", "/api/ask"].includes(path)) {
+    return sendJSON(res, 404, {
+      error: "Route not found"
+    });
+  }
+
+  if (!ACCESS_TOKEN) {
+    return sendJSON(res, 500, {
+      error: "AGENT_ACCESS_TOKEN is not configured"
+    });
+  }
+
+  if (getToken(req) !== ACCESS_TOKEN) {
+    return sendJSON(res, 401, {
+      error: "Unauthorized"
+    });
+  }
+
+  if (!GEMINI_API_KEY) {
+    return sendJSON(res, 500, {
+      error: "GEMINI_API_KEY is not configured"
+    });
+  }
+
+  let data;
+
+  try {
+    data = await readJSON(req);
+  } catch {
+    return sendJSON(res, 400, {
+      error: "Invalid JSON request"
+    });
+  }
+
+  const contents = makeContents(data);
+
+  if (!contents.length) {
+    return sendJSON(res, 400, {
+      error: "Message is required"
+    });
+  }
+
+  try {
+    const url =
+      "https://generativelanguage.googleapis.com/v1beta/models/" +
+      encodeURIComponent(GEMINI_MODEL) +
+      ":generateContent";
+
+    const response = await fetch(url, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "x-goog-api-key": GEMINI_API_KEY
+      },
+      body: JSON.stringify({
+        contents,
+        generationConfig: {
+          maxOutputTokens: 1024
+        }
+      })
+    });
+
+    const result = await response.json();
+
+    if (!response.ok) {
+      console.error("Gemini API error:", {
+        status: response.status,
+        message: result.error?.message
+      });
+
+      return sendJSON(res, 502, {
+        error: "AI request failed",
+        providerStatus: response.status,
+        detail: result.error?.message || "Unknown provider error"
+      });
+    }
+
+    const reply = (result.candidates || [])
+      .flatMap(candidate => candidate.content?.parts || [])
+      .map(part => part.text || "")
+      .join("")
+      .trim();
+
+    if (!reply) {
+      return sendJSON(res, 502, {
+        error: "Gemini returned an empty response"
+      });
+    }
+
+    return sendJSON(res, 200, {
+      reply,
+      response: reply,
+      message: reply
+    });
+
+  } catch (error) {
+    console.error("Backend error:", error.message);
+
+    return sendJSON(res, 500, {
+      error: "Internal server error"
+    });
+  }
+});
+
+server.listen(PORT, "0.0.0.0", () => {
+  console.log(`Nova AI Gemini backend running on port ${PORT}`);
+});
 
